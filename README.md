@@ -1,6 +1,6 @@
 # wmr_cba_linux
 
-Linux tools for West Mountain Radio CBA battery analyzers like the [CBA IV](http://www.westmountainradio.com/cba.php).
+Linux tools for West Mountain Radio CBA battery analyzers like the [CBA IV or CBA V](http://www.westmountainradio.com/cba.php).
 
 These tools talk to the battery analyzer via libusb, using [da66en's python_wmr_cba library](https://github.com/da66en/python_wmr_cba/).
 
