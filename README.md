@@ -21,4 +21,8 @@ sudo ./cba_cli.py --amps 0.2 --cutoff 10.0 --interval 10 --csv battery.csv
 
 ## License
 
-FIXME
+This project is licensed under the MIT License.  See the LICENSE file for
+more information.
+
+It includes third-party components licensed under MIT; see their respective
+LICENSE files in the wmr_cba subdirectory for details.
