@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cba4_discharge_test.py
+cba_cli.py
 
 Battery discharge test using a West Mountain Radio CBA-IV via the wmr_cba library.
 
@@ -132,7 +132,7 @@ def main() -> int:
     parser.add_argument("--amps", type=float, required=True, help="Discharge current in amps (e.g., 5.0).")
     parser.add_argument("--cutoff", type=float, required=True, help="Cutoff voltage in volts (e.g., 10.5).")
     parser.add_argument(
-        "--interval", type=float, default=1.0, help="Sampling/print interval in seconds (default: 1.0)."
+        "--interval", type=float, default=1.0, help="Sampling/print interval in seconds, minimum 1.0 (default: 1.0)."
     )
     parser.add_argument(
         "--csv",
@@ -143,14 +143,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.amps <= 0:
-        print("ERROR: --amps must be > 0", file=sys.stderr)
+    if args.amps <= 0 or args.amps > 40:
+        print("ERROR: --amps must be > 0 and <= 40", file=sys.stderr)
         return 2
     if args.cutoff <= 0:
         print("ERROR: --cutoff must be > 0", file=sys.stderr)
         return 2
-    if args.interval <= 0:
-        print("ERROR: --interval must be > 0", file=sys.stderr)
+    if args.interval < 1.0:
+        print("ERROR: --interval must be >= 1.0", file=sys.stderr)
         return 2
 
     _install_signal_handlers()
@@ -188,12 +188,53 @@ def main() -> int:
                 print("\nStop requested (signal received).")
                 break
 
+            # Sample voltage over the interval to average out noise.
+            # The worker thread updates cached status every ~750ms, so
+            # longer intervals yield more distinct readings.
+            voltage_samples = []
+            sample_interval = 0.5  # seconds between samples
+            interval_end = time.monotonic() + float(args.interval)
+            status = None
+
+            while not _stop_requested:
+                try:
+                    s = cba.get_status_response()
+                except Exception:
+                    s = None
+
+                if s is not None:
+                    status = s
+                    if (s[1] & 2) != 2:
+                        break
+                    sample_v = (s[20] + (s[21] << 8) + (s[22] << 16) + (s[23] << 24)) / 1_000_000
+                    voltage_samples.append(sample_v)
+
+                remaining = interval_end - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(sample_interval, remaining))
+
+            if _stop_requested:
+                print("\nStop requested (signal received).")
+                break
+
+            if status is None:
+                continue
+
+            running = (status[1] & 2) == 2
+            if not running:
+                print("\nCBA-IV reports test has stopped (is_running() == False).")
+                break
+
             now = time.monotonic()
             dt = now - last_t
             last_t = now
 
-            v = float(cba.get_voltage())
-            a = float(cba.get_measured_current())
+            v = sum(voltage_samples) / len(voltage_samples)
+            # Use set current (status[3:7]) rather than measured current (status[16:20]).
+            # Measured current is only 10-bit resolution across 40A (~0.04A steps),
+            # which causes visible jumps in the display and integration error in Ah/Wh.
+            a = (status[3] + (status[4] << 8) + (status[5] << 16) + (status[6] << 24)) / 1_000_000
             w = v * a
 
             if dt > 0:
@@ -207,27 +248,10 @@ def main() -> int:
             if csv_f is not None:
                 _write_csv_line(csv_f, elapsed, v, a, w, ah, wh)
 
-            # Stop if device says it stopped (after having started)
-            try:
-                if not bool(cba.is_running()):
-                    print("\nCBA-IV reports test has stopped (is_running() == False).")
-                    break
-            except Exception:
-                # If is_running fails transiently, ignore and rely on voltage guard/signal.
-                pass
-
             # Extra guard
             if v <= float(args.cutoff):
                 print(f"\nCutoff reached (guard): {v:.4f} V <= {float(args.cutoff):.4f} V")
                 break
-
-            _sleep_interruptible(float(args.interval))
-
-        # Stop discharge
-        try:
-            cba.do_stop()
-        except Exception:
-            pass
 
         duration = time.monotonic() - start_t
         print(f"Total amp-hours:  {ah:.6f} Ah")

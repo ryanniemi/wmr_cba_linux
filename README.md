@@ -11,13 +11,39 @@ On Debian and Ubuntu, install the python3-usb package:
 sudo apt-get install python3-usb
 ```
 
+For the GUI, install PySide6 (preferred) or PyQt6:
+```
+pip install PySide6
+```
+or:
+```
+pip install PyQt6 PyQt6-Charts
+```
+
 ## Usage
+
+### CLI
 
 Run a battery test at 0.2A, with a cutoff voltage of 10.0VDC, showing stats
 and writing a line to the battery.csv file every 10 seconds:
 ```
 sudo ./cba_cli.py --amps 0.2 --cutoff 10.0 --interval 10 --csv battery.csv
 ```
+
+- `--amps`: Discharge current, 0–40A (CBA IV hardware max)
+- `--cutoff`: Cutoff voltage in volts
+- `--interval`: Sampling/print interval in seconds (minimum 1.0, default 1.0)
+- `--csv FILE`: Optional CSV log output
+
+### GUI
+
+Launch the graphical interface with live voltage/current/power charting:
+```
+sudo python3 cba_gui.py
+```
+
+The GUI features a live chart that can be toggled between time and amp-hours
+on the X axis, even mid-test.
 
 ## License
 
