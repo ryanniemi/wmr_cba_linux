@@ -4,6 +4,8 @@ Linux tools for West Mountain Radio CBA battery analyzers like the [CBA IV or CB
 
 These tools talk to the battery analyzer via libusb, using [da66en's python_wmr_cba library](https://github.com/da66en/python_wmr_cba/).
 
+![GUI Screenshot](images/gui.png)
+
 ## Installation
 
 On Debian and Ubuntu, install the python3-usb package:
@@ -41,8 +43,6 @@ Launch the graphical interface with live voltage/current/power charting:
 ```
 sudo python3 cba_gui.py
 ```
-
-![GUI Screenshot](images/gui.png)
 
 Features:
 - Device selector with scan button for multiple CBA devices
