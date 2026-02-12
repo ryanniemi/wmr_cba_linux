@@ -42,6 +42,8 @@ Launch the graphical interface with live voltage/current/power charting:
 sudo python3 cba_gui.py
 ```
 
+![GUI Screenshot](images/gui.png)
+
 Features:
 - Device selector with scan button for multiple CBA devices
 - Mode selector (currently Constant Current Discharge)

@@ -18,6 +18,8 @@ Run:
 
 from __future__ import annotations
 
+import csv
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -105,14 +107,12 @@ class CbaWorker(QtCore.QThread):
     def run(self) -> None:
         try:
             if self.interface_number is not None:
-                self.status_signal.emit(f"Using {QT_API}. Connecting to CBA-IV (device {self.interface_number})...")
                 iface = wmr_cba.MpOrLibUsb(self.interface_number)
                 self._cba = wmr_cba.CBA4(interface=iface)
             else:
-                self.status_signal.emit(f"Using {QT_API}. Connecting to CBA-IV...")
                 self._cba = wmr_cba.CBA4()
             sn = self._cba.get_serial_number()
-            self.status_signal.emit(f"Connected (SN: {sn}). Starting test...")
+            self.status_signal.emit(f"Connected to CBA-IV (SN: {sn}). Starting test...")
 
             # Start test with device cutoff enforcement
             self._cba.do_start(self.amps, self.cutoff)
@@ -212,7 +212,7 @@ class CbaWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CBA-IV Battery Test (Qt)")
+        self.setWindowTitle("CBA-IV Battery Analyzer")
         self.resize(1050, 700)
 
         self.worker: Optional[CbaWorker] = None
@@ -241,19 +241,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cutoff_edit.setSuffix(" V")
         self.cutoff_edit.valueChanged.connect(self._on_cutoff_changed)
 
-        self.interval_edit = QtWidgets.QDoubleSpinBox()
-        self.interval_edit.setRange(1.0, 10.0)
-        self.interval_edit.setDecimals(2)
-        self.interval_edit.setValue(1.0)
-        self.interval_edit.setSuffix(" s")
-
-        self.xaxis_combo = QtWidgets.QComboBox()
-        self.xaxis_combo.addItems(["Time (s)", "Amp-hours (Ah)"])
-        self.xaxis_combo.currentIndexChanged.connect(self._on_xaxis_changed)
+        # xaxis_combo created later as a floating overlay (needs self as parent)
 
         self.toggle_btn = QtWidgets.QPushButton("Start")
         self.toggle_btn.clicked.connect(self._on_toggle)
         self._running = False
+
+        self.save_btn = QtWidgets.QPushButton("Save CSV")
+        self.save_btn.clicked.connect(self._save_csv)
+        self.save_btn.setEnabled(False)
+
+        self.load_btn = QtWidgets.QPushButton("Load CSV")
+        self.load_btn.clicked.connect(self._load_csv)
 
         device_row = QtWidgets.QHBoxLayout()
         device_row.addWidget(self.device_combo, 1)
@@ -264,12 +263,15 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addRow("Mode:", self.mode_combo)
         controls.addRow("Discharge current:", self.amps_edit)
         controls.addRow("Cutoff voltage:", self.cutoff_edit)
-        controls.addRow("Update interval:", self.interval_edit)
-        controls.addRow("X axis:", self.xaxis_combo)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addWidget(self.toggle_btn)
+        btn_row.addWidget(self.save_btn)
+        btn_row.addWidget(self.load_btn)
 
         controls_box = QtWidgets.QVBoxLayout()
         controls_box.addLayout(controls)
-        controls_box.addWidget(self.toggle_btn)
+        controls_box.addLayout(btn_row)
         controls_box.addStretch(1)
 
         controls_widget = QtWidgets.QWidget()
@@ -280,6 +282,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stat_fields = {}
         stats_group = QtWidgets.QGroupBox("Stats")
         stats_layout = QtWidgets.QFormLayout()
+        stats_layout.setHorizontalSpacing(20)
         for key, label in [
             ("duration", "Duration:"),
             ("voltage", "Voltage:"),
@@ -322,23 +325,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chart.addSeries(self.series_w)
         self.chart.addSeries(self.series_cutoff)
         self.chart.legend().setVisible(True)
-        self.chart.setTitle("Live Discharge Telemetry")
+        self.chart.legend().setLabelColor(QtGui.QColor("#E0E0E0"))
+        self.chart.setTitle("")
+        self.chart.setTitleBrush(QtGui.QBrush(QtGui.QColor("#E0E0E0")))
 
-        # Chart styling: light gray plot area with black border
-        self.chart.setBackgroundBrush(QtGui.QBrush(QtGui.QColor("#F5F5F5")))
-        self.chart.setBackgroundPen(QtGui.QPen(QtGui.QColor("#000000"), 1))
-        self.chart.setPlotAreaBackgroundBrush(QtGui.QBrush(QtGui.QColor("#EAEAEA")))
+        # Chart styling: dark plot area
+        self.chart.setBackgroundBrush(QtGui.QBrush(QtGui.QColor("#464646")))
+        self.chart.setBackgroundPen(QtGui.QPen(QtGui.QColor("#6A6A6A"), 1))
+        self.chart.setPlotAreaBackgroundBrush(QtGui.QBrush(QtGui.QColor("#414141")))
         self.chart.setPlotAreaBackgroundVisible(True)
 
         # Grid line pens
-        grid_pen = QtGui.QPen(QtGui.QColor("#B0B0B0"))
+        grid_pen = QtGui.QPen(QtGui.QColor("#585858"))
         grid_pen.setWidth(1)
-        minor_pen = QtGui.QPen(QtGui.QColor("#D0D0D0"))
+        minor_pen = QtGui.QPen(QtGui.QColor("#4A4A4A"))
         minor_pen.setWidth(1)
-        axis_pen = QtGui.QPen(QtGui.QColor("#000000"), 1)
+        axis_pen = QtGui.QPen(QtGui.QColor("#999999"), 1)
+
+        label_color = QtGui.QColor("#E0E0E0")
+        label_brush = QtGui.QBrush(label_color)
 
         self.axis_x = QValueAxis()
         self.axis_x.setTitleText("Time (s)")
+        self.axis_x.setTitleBrush(label_brush)
+        self.axis_x.setLabelsColor(label_color)
         self.axis_x.setRange(0, 60)
         self.axis_x.setGridLineVisible(True)
         self.axis_x.setMinorGridLineVisible(True)
@@ -347,22 +357,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.axis_x.setMinorGridLinePen(minor_pen)
         self.axis_x.setLinePen(axis_pen)
 
-        self.axis_y = QValueAxis()
-        self.axis_y.setTitleText("Value")
-        self.axis_y.setRange(0, 20)
-        self.axis_y.setGridLineVisible(True)
-        self.axis_y.setMinorGridLineVisible(True)
-        self.axis_y.setMinorTickCount(1)
-        self.axis_y.setGridLinePen(grid_pen)
-        self.axis_y.setMinorGridLinePen(minor_pen)
-        self.axis_y.setLinePen(axis_pen)
+        # Left Y axis: Voltage
+        self.axis_y_v = QValueAxis()
+        self.axis_y_v.setTitleText("Voltage (V)")
+        self.axis_y_v.setTitleBrush(label_brush)
+        self.axis_y_v.setLabelsColor(label_color)
+        self.axis_y_v.setRange(0, 20)
+        self.axis_y_v.setGridLineVisible(True)
+        self.axis_y_v.setGridLinePen(grid_pen)
+        self.axis_y_v.setMinorGridLineVisible(False)
+        self.axis_y_v.setLinePen(axis_pen)
+
+        # Right Y axis: Current and Power
+        self.axis_y_aw = QValueAxis()
+        self.axis_y_aw.setTitleText("Current (A) / Power (W)")
+        self.axis_y_aw.setTitleBrush(label_brush)
+        self.axis_y_aw.setLabelsColor(label_color)
+        self.axis_y_aw.setRange(0, 10)
+        self.axis_y_aw.setGridLineVisible(False)
+        self.axis_y_aw.setMinorGridLineVisible(False)
+        self.axis_y_aw.setLinePen(axis_pen)
 
         self.chart.addAxis(self.axis_x, QtCore.Qt.AlignmentFlag.AlignBottom)
-        self.chart.addAxis(self.axis_y, QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.chart.addAxis(self.axis_y_v, QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.chart.addAxis(self.axis_y_aw, QtCore.Qt.AlignmentFlag.AlignRight)
 
-        for s in (self.series_v, self.series_a, self.series_w, self.series_cutoff):
+        # Attach voltage + cutoff to left axis
+        for s in (self.series_v, self.series_cutoff):
             s.attachAxis(self.axis_x)
-            s.attachAxis(self.axis_y)
+            s.attachAxis(self.axis_y_v)
+
+        # Attach current + power to right axis
+        for s in (self.series_a, self.series_w):
+            s.attachAxis(self.axis_x)
+            s.attachAxis(self.axis_y_aw)
 
         self.chart_view = QChartView(self.chart)
         self.chart_view.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
@@ -386,7 +414,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setCentralWidget(splitter)
 
-        self._y_max = 1.0
+        # X axis selector floating over the bottom-right corner of the window
+        self.xaxis_combo = QtWidgets.QComboBox(self)
+        self.xaxis_combo.addItems(["Time (s)", "Amp-hours (Ah)"])
+        self.xaxis_combo.currentIndexChanged.connect(self._on_xaxis_changed)
+        self._position_xaxis_overlay()
+
+        self._v_min = float('inf')
+        self._v_max = 0.0
+        self._aw_max = 0.0
+        self._time_unit = 's'
+        self._time_divisor = 1
         self._samples: list[Sample] = []
         self._reset_series()
 
@@ -394,12 +432,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.series_v.clear()
         self.series_a.clear()
         self.series_w.clear()
-        self._y_max = 1.0
+        self._v_min = float('inf')
+        self._v_max = 0.0
+        self._aw_max = 0.0
+        self._time_unit = 's'
+        self._time_divisor = 1
         self._samples = []
+        self.save_btn.setEnabled(False)
         self.axis_x.setRange(0, 60)
+        self.axis_x.setTickCount(12)
         self.axis_x.applyNiceNumbers()
-        self.axis_y.setRange(0, 20)
-        self.axis_y.applyNiceNumbers()
+        self.axis_y_v.setRange(0, 20)
+        self.axis_y_v.applyNiceNumbers()
+        self.axis_y_aw.setRange(0, 10)
+        self.axis_y_aw.applyNiceNumbers()
         self._update_cutoff_line()
 
     def _update_cutoff_line(self):
@@ -446,6 +492,21 @@ class MainWindow(QtWidgets.QMainWindow):
         for val in self._stat_fields.values():
             val.setText(text)
 
+    def _position_xaxis_overlay(self):
+        """Position the X-axis selector at the bottom-right edge of the chart area."""
+        combo_w = 150
+        combo_h = self.xaxis_combo.sizeHint().height()
+        self.xaxis_combo.setFixedWidth(combo_w)
+        cw = self.centralWidget()
+        x_combo = cw.x() + cw.width() - combo_w - 6
+        y = cw.y() + cw.height() - combo_h - 6
+        self.xaxis_combo.move(x_combo, y)
+        self.xaxis_combo.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_xaxis_overlay()
+
     def closeEvent(self, event):
         if self.worker is not None:
             self.worker.request_stop()
@@ -464,17 +525,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         amps = float(self.amps_edit.value())
         cutoff = float(self.cutoff_edit.value())
-        interval_s = float(self.interval_edit.value())
 
         self._reset_series()
-        self._append_log(f"Starting: {amps:.3f}A cutoff {cutoff:.3f}V interval {interval_s:.2f}s")
+        self._append_log(f"Starting: {amps:.3f}A cutoff {cutoff:.3f}V")
         self._set_stats("Starting...")
 
         self._running = True
         self.toggle_btn.setText("Stop")
+        self.device_combo.setEnabled(False)
+        self.scan_btn.setEnabled(False)
+        self.mode_combo.setEnabled(False)
+        self.amps_edit.setEnabled(False)
+        self.cutoff_edit.setEnabled(False)
 
         interface_number = self.device_combo.currentData()
-        self.worker = CbaWorker(amps=amps, cutoff=cutoff, interval_s=interval_s,
+        self.worker = CbaWorker(amps=amps, cutoff=cutoff, interval_s=1.0,
                                 interface_number=interface_number)
         self.worker.sample_signal.connect(self.on_sample)
         self.worker.status_signal.connect(self.on_status)
@@ -504,43 +569,113 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._running = False
         self.toggle_btn.setText("Start")
+        self.device_combo.setEnabled(True)
+        self.scan_btn.setEnabled(True)
+        self.mode_combo.setEnabled(True)
+        self.amps_edit.setEnabled(True)
+        self.cutoff_edit.setEnabled(True)
 
     def _x_for_sample(self, sample: Sample) -> float:
         if self.xaxis_combo.currentIndex() == 1:
             return sample.ah
-        return sample.t_s
+        return sample.t_s / self._time_divisor
 
     def _replot(self):
         """Re-plot all stored samples using the current X-axis mode."""
-        self.series_v.clear()
-        self.series_a.clear()
-        self.series_w.clear()
+        pts_v = []
+        pts_a = []
+        pts_w = []
         for s in self._samples:
             x = self._x_for_sample(s)
-            self.series_v.append(x, s.v)
-            self.series_a.append(x, s.a)
-            self.series_w.append(x, s.w)
+            pts_v.append(QtCore.QPointF(x, s.v))
+            pts_a.append(QtCore.QPointF(x, s.a))
+            pts_w.append(QtCore.QPointF(x, s.w))
+        self.series_v.replace(pts_v)
+        self.series_a.replace(pts_a)
+        self.series_w.replace(pts_w)
         self._update_axes()
 
     def _update_axes(self):
         if self.xaxis_combo.currentIndex() == 1:
             self.axis_x.setTitleText("Amp-hours (Ah)")
             x_last = self._samples[-1].ah if self._samples else 0
-            x_max = max(0.001, x_last * 1.05)
         else:
-            self.axis_x.setTitleText("Time (s)")
-            x_last = self._samples[-1].t_s if self._samples else 0
-            x_max = max(60.0, x_last * 1.05)
-        self.axis_x.setRange(0, x_max)
-        self.axis_x.applyNiceNumbers()
+            # Auto-scale time unit based on test duration
+            t_max = self._samples[-1].t_s if self._samples else 0
+            if t_max >= 10800:   # >= 180 min -> hours
+                unit, divisor, label = 'hr', 3600, 'Time (hr)'
+            elif t_max >= 180:   # >= 3 min -> minutes
+                unit, divisor, label = 'min', 60, 'Time (min)'
+            else:
+                unit, divisor, label = 's', 1, 'Time (s)'
 
-        y_hi = self._y_max * 1.25 + 0.1
-        self.axis_y.setRange(0, y_hi)
-        self.axis_y.applyNiceNumbers()
+            if unit != self._time_unit:
+                self._time_unit = unit
+                self._time_divisor = divisor
+                # Reset axis range so the replot uses the new scale,
+                # not the stale range from the old unit.
+                self.axis_x.setRange(0, 1)
+                self._replot()
+                return
+
+            self.axis_x.setTitleText(label)
+            x_last = t_max / divisor
+
+        # Rescale X axis when data approaches the current edge (>90%) or
+        # when the axis is much too wide for the data (<30%, e.g. after
+        # switching to Ah mode with a small-capacity battery).
+        current_x_max = self.axis_x.max()
+        needs_grow = x_last > current_x_max * 0.90
+        needs_shrink = x_last > 0 and x_last < current_x_max * 0.30
+        if needs_grow or needs_shrink:
+            new_x_max = x_last * 1.25
+            if self.xaxis_combo.currentIndex() == 1:
+                new_x_max = max(0.001, new_x_max)
+            elif self._time_unit == 's':
+                new_x_max = max(60.0, new_x_max)
+            else:
+                new_x_max = max(1.0, new_x_max)
+            self.axis_x.setRange(0, new_x_max)
+            self.axis_x.setTickCount(12)
+            self.axis_x.applyNiceNumbers()
+
+        # Voltage axis (left): pick finest nice interval that keeps ticks <= 16
+        if self._samples and self._v_min <= self._v_max:
+            cutoff = float(self.cutoff_edit.value())
+            raw_min = min(self._v_min, cutoff)
+            raw_max = self._v_max
+            chosen = None
+            for iv in (0.1, 0.2, 0.5, 1, 2, 5):
+                # Subtract one interval so the cutoff line isn't pinned to the bottom edge
+                v_lo = math.floor(raw_min / iv) * iv - iv
+                v_hi = math.ceil(raw_max / iv) * iv
+                if v_hi <= v_lo:
+                    v_hi += iv
+                n_ticks = round((v_hi - v_lo) / iv) + 1
+                if n_ticks <= 16:
+                    chosen = (v_lo, v_hi, n_ticks)
+                    break
+            if chosen:
+                self.axis_y_v.setRange(chosen[0], chosen[1])
+                self.axis_y_v.setTickCount(chosen[2])
+            else:
+                self.axis_y_v.setRange(math.floor(raw_min), math.ceil(raw_max))
+                self.axis_y_v.applyNiceNumbers()
+
+        # Current/Power axis (right) — match tick count to left axis
+        # so labels align with the voltage grid lines.
+        v_ticks = self.axis_y_v.tickCount()
+        aw_hi = max(1.0, self._aw_max) * 1.25 + 0.1
+        self.axis_y_aw.setRange(0, aw_hi)
+        self.axis_y_aw.setTickCount(v_ticks)
+        self.axis_y_aw.applyNiceNumbers()
+        # applyNiceNumbers may change the tick count; force it back
+        self.axis_y_aw.setTickCount(v_ticks)
 
         self._update_cutoff_line()
 
     def _on_xaxis_changed(self, _index: int):
+        self.axis_x.setRange(0, 1)
         self._replot()
 
     def on_sample(self, sample: Sample):
@@ -554,6 +689,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stat_fields["wh"].setText(f"{sample.wh:.6f} Wh")
 
         self._samples.append(sample)
+        self.save_btn.setEnabled(True)
 
         # Add new point to chart
         x = self._x_for_sample(sample)
@@ -561,14 +697,101 @@ class MainWindow(QtWidgets.QMainWindow):
         self.series_a.append(x, sample.a)
         self.series_w.append(x, sample.w)
 
-        # Auto-scale Y axis: track the max seen so the axis only grows,
-        # preventing older data from going off-screen when values decrease.
-        self._y_max = max(self._y_max, sample.v, sample.a, sample.w)
+        # Auto-scale Y axes independently
+        self._v_min = min(self._v_min, sample.v)
+        self._v_max = max(self._v_max, sample.v)
+        self._aw_max = max(self._aw_max, sample.a, sample.w)
         self._update_axes()
+
+
+    def _save_csv(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("t(s),voltage(V),current(A),power(W),amp_hours(Ah),watt_hours(Wh)\n")
+                for s in self._samples:
+                    f.write(f"{s.t_s:.0f},{s.v:.4f},{s.a:.4f},{s.w:.3f},{s.ah:.6f},{s.wh:.6f}\n")
+            self._append_log(f"Saved {len(self._samples)} samples to {path}")
+        except Exception as e:
+            self._append_log(f"Save failed: {e}")
+
+    def _load_csv(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            samples = []
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    samples.append(Sample(
+                        t_s=float(row["t(s)"]),
+                        v=float(row["voltage(V)"]),
+                        a=float(row["current(A)"]),
+                        w=float(row["power(W)"]),
+                        ah=float(row["amp_hours(Ah)"]),
+                        wh=float(row["watt_hours(Wh)"]),
+                    ))
+            if not samples:
+                self._append_log(f"No data rows in {path}")
+                return
+
+            self._reset_series()
+            self._samples = samples
+            self.save_btn.setEnabled(True)
+
+            for s in self._samples:
+                self._v_min = min(self._v_min, s.v)
+                self._v_max = max(self._v_max, s.v)
+                self._aw_max = max(self._aw_max, s.a, s.w)
+
+            self._replot()
+
+            last = self._samples[-1]
+            dur = self._fmt_duration(last.t_s)
+            self._stat_fields["duration"].setText(f"{dur} ({last.t_s:.1f} s)")
+            self._stat_fields["voltage"].setText(f"{last.v:.4f} V")
+            self._stat_fields["current"].setText(f"{last.a:.4f} A")
+            self._stat_fields["power"].setText(f"{last.w:.3f} W")
+            self._stat_fields["ah"].setText(f"{last.ah:.6f} Ah")
+            self._stat_fields["wh"].setText(f"{last.wh:.6f} Wh")
+
+            self._append_log(f"Loaded {len(samples)} samples from {path}")
+        except Exception as e:
+            self._append_log(f"Load failed: {e}")
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+
+    # Dark palette for the entire application
+    palette = QtGui.QPalette()
+    dark = QtGui.QColor("#464646")
+    mid = QtGui.QColor("#595959")
+    light_text = QtGui.QColor("#E0E0E0")
+    highlight = QtGui.QColor("#2A82DA")
+    palette.setColor(QtGui.QPalette.ColorRole.Window, dark)
+    palette.setColor(QtGui.QPalette.ColorRole.WindowText, light_text)
+    palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#414141"))
+    palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, mid)
+    palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, mid)
+    palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, light_text)
+    palette.setColor(QtGui.QPalette.ColorRole.Text, light_text)
+    palette.setColor(QtGui.QPalette.ColorRole.Button, mid)
+    palette.setColor(QtGui.QPalette.ColorRole.ButtonText, light_text)
+    palette.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor("#FF4444"))
+    palette.setColor(QtGui.QPalette.ColorRole.Link, highlight)
+    palette.setColor(QtGui.QPalette.ColorRole.Highlight, highlight)
+    palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#FFFFFF"))
+    palette.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#808080"))
+    palette.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text, QtGui.QColor("#808080"))
+    palette.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#808080"))
+    app.setPalette(palette)
+
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
