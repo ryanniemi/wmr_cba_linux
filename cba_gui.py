@@ -57,11 +57,13 @@ class CbaWorker(QtCore.QThread):
     status_signal = QtCore.pyqtSignal(str) if QT_API == "PyQt6" else QtCore.Signal(str)
     finished_signal = QtCore.pyqtSignal(str) if QT_API == "PyQt6" else QtCore.Signal(str)
 
-    def __init__(self, amps: float, cutoff: float, interval_s: float, parent=None):
+    def __init__(self, amps: float, cutoff: float, interval_s: float,
+                 serial_number: Optional[int] = None, parent=None):
         super().__init__(parent)
         self.amps = float(amps)
         self.cutoff = float(cutoff)
         self.interval_s = float(interval_s)
+        self.serial_number = serial_number
 
         self._stop_requested = False
         self._cba = None
@@ -102,8 +104,9 @@ class CbaWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            self.status_signal.emit(f"Using {QT_API}. Connecting to CBA-IV...")
-            self._cba = wmr_cba.CBA4()
+            sn_str = f" (SN: {self.serial_number})" if self.serial_number else ""
+            self.status_signal.emit(f"Using {QT_API}. Connecting to CBA-IV{sn_str}...")
+            self._cba = wmr_cba.CBA4(serial_number=self.serial_number)
             self.status_signal.emit("Connected. Starting test...")
 
             # Start test with device cutoff enforcement
@@ -210,6 +213,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker: Optional[CbaWorker] = None
         self.t0_wall = time.time()
 
+        # ---------- Device / Mode ----------
+        self.device_combo = QtWidgets.QComboBox()
+        self.device_combo.addItem("Auto (first available)", None)
+        self.scan_btn = QtWidgets.QPushButton("Scan")
+        self.scan_btn.clicked.connect(self._on_scan_devices)
+
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItem("Constant Current Discharge")
+
         # ---------- Controls ----------
         self.amps_edit = QtWidgets.QDoubleSpinBox()
         self.amps_edit.setRange(0.01, 40.0)
@@ -222,6 +234,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cutoff_edit.setDecimals(3)
         self.cutoff_edit.setValue(10.5)
         self.cutoff_edit.setSuffix(" V")
+        self.cutoff_edit.valueChanged.connect(self._on_cutoff_changed)
 
         self.interval_edit = QtWidgets.QDoubleSpinBox()
         self.interval_edit.setRange(1.0, 10.0)
@@ -233,35 +246,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.xaxis_combo.addItems(["Time (s)", "Amp-hours (Ah)"])
         self.xaxis_combo.currentIndexChanged.connect(self._on_xaxis_changed)
 
-        self.start_btn = QtWidgets.QPushButton("Start")
-        self.stop_btn = QtWidgets.QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
+        self.toggle_btn = QtWidgets.QPushButton("Start")
+        self.toggle_btn.clicked.connect(self._on_toggle)
+        self._running = False
 
-        self.start_btn.clicked.connect(self.on_start)
-        self.stop_btn.clicked.connect(self.on_stop)
+        device_row = QtWidgets.QHBoxLayout()
+        device_row.addWidget(self.device_combo, 1)
+        device_row.addWidget(self.scan_btn)
 
         controls = QtWidgets.QFormLayout()
+        controls.addRow("Device:", device_row)
+        controls.addRow("Mode:", self.mode_combo)
         controls.addRow("Discharge current:", self.amps_edit)
         controls.addRow("Cutoff voltage:", self.cutoff_edit)
         controls.addRow("Update interval:", self.interval_edit)
         controls.addRow("X axis:", self.xaxis_combo)
 
-        btns = QtWidgets.QHBoxLayout()
-        btns.addWidget(self.start_btn)
-        btns.addWidget(self.stop_btn)
-
         controls_box = QtWidgets.QVBoxLayout()
         controls_box.addLayout(controls)
-        controls_box.addLayout(btns)
+        controls_box.addWidget(self.toggle_btn)
         controls_box.addStretch(1)
 
         controls_widget = QtWidgets.QWidget()
         controls_widget.setLayout(controls_box)
 
         # ---------- Stats ----------
-        self.stat_label = QtWidgets.QLabel("Idle.")
-        self.stat_label.setFont(QtGui.QFont("Monospace", 11))
-        self.stat_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        stat_font = QtGui.QFont("Monospace", 11)
+        self._stat_fields = {}
+        stats_group = QtWidgets.QGroupBox("Stats")
+        stats_layout = QtWidgets.QFormLayout()
+        for key, label in [
+            ("duration", "Duration:"),
+            ("voltage", "Voltage:"),
+            ("current", "Current:"),
+            ("power", "Power:"),
+            ("ah", "Amp-hours:"),
+            ("wh", "Watt-hours:"),
+        ]:
+            val = QtWidgets.QLabel("--")
+            val.setFont(stat_font)
+            val.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            stats_layout.addRow(label, val)
+            self._stat_fields[key] = val
+        stats_group.setLayout(stats_layout)
 
         # ---------- Log ----------
         self.log = QtWidgets.QPlainTextEdit()
@@ -276,25 +303,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.series_a.setName("Current (A)")
         self.series_w.setName("Power (W)")
 
+        # Cutoff threshold line (red, dashed)
+        self.series_cutoff = QLineSeries()
+        self.series_cutoff.setName("Cutoff (V)")
+        cutoff_pen = QtGui.QPen(QtGui.QColor("#DC3545"))
+        cutoff_pen.setWidth(2)
+        cutoff_pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+        self.series_cutoff.setPen(cutoff_pen)
+
         self.chart = QChart()
         self.chart.addSeries(self.series_v)
         self.chart.addSeries(self.series_a)
         self.chart.addSeries(self.series_w)
+        self.chart.addSeries(self.series_cutoff)
         self.chart.legend().setVisible(True)
         self.chart.setTitle("Live Discharge Telemetry")
+
+        # Chart styling: light gray plot area with black border
+        self.chart.setBackgroundBrush(QtGui.QBrush(QtGui.QColor("#F5F5F5")))
+        self.chart.setBackgroundPen(QtGui.QPen(QtGui.QColor("#000000"), 1))
+        self.chart.setPlotAreaBackgroundBrush(QtGui.QBrush(QtGui.QColor("#EAEAEA")))
+        self.chart.setPlotAreaBackgroundVisible(True)
+
+        # Grid line pens
+        grid_pen = QtGui.QPen(QtGui.QColor("#B0B0B0"))
+        grid_pen.setWidth(1)
+        minor_pen = QtGui.QPen(QtGui.QColor("#D0D0D0"))
+        minor_pen.setWidth(1)
+        axis_pen = QtGui.QPen(QtGui.QColor("#000000"), 1)
 
         self.axis_x = QValueAxis()
         self.axis_x.setTitleText("Time (s)")
         self.axis_x.setRange(0, 60)
+        self.axis_x.setGridLineVisible(True)
+        self.axis_x.setMinorGridLineVisible(True)
+        self.axis_x.setMinorTickCount(1)
+        self.axis_x.setGridLinePen(grid_pen)
+        self.axis_x.setMinorGridLinePen(minor_pen)
+        self.axis_x.setLinePen(axis_pen)
 
         self.axis_y = QValueAxis()
         self.axis_y.setTitleText("Value")
         self.axis_y.setRange(0, 20)
+        self.axis_y.setGridLineVisible(True)
+        self.axis_y.setMinorGridLineVisible(True)
+        self.axis_y.setMinorTickCount(1)
+        self.axis_y.setGridLinePen(grid_pen)
+        self.axis_y.setMinorGridLinePen(minor_pen)
+        self.axis_y.setLinePen(axis_pen)
 
         self.chart.addAxis(self.axis_x, QtCore.Qt.AlignmentFlag.AlignBottom)
         self.chart.addAxis(self.axis_y, QtCore.Qt.AlignmentFlag.AlignLeft)
 
-        for s in (self.series_v, self.series_a, self.series_w):
+        for s in (self.series_v, self.series_a, self.series_w, self.series_cutoff):
             s.attachAxis(self.axis_x)
             s.attachAxis(self.axis_y)
 
@@ -304,8 +365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ---------- Layout ----------
         left = QtWidgets.QVBoxLayout()
         left.addWidget(controls_widget)
-        left.addWidget(QtWidgets.QLabel("Status / Stats:"))
-        left.addWidget(self.stat_label)
+        left.addWidget(stats_group)
         left.addWidget(QtWidgets.QLabel("Log:"))
         left.addWidget(self.log)
 
@@ -332,7 +392,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._y_max = 1.0
         self._samples = []
         self.axis_x.setRange(0, 60)
+        self.axis_x.applyNiceNumbers()
         self.axis_y.setRange(0, 20)
+        self.axis_y.applyNiceNumbers()
+        self._update_cutoff_line()
+
+    def _update_cutoff_line(self):
+        """Redraw the horizontal cutoff threshold line across the full X range."""
+        cutoff_v = float(self.cutoff_edit.value())
+        x_max = self.axis_x.max()
+        self.series_cutoff.clear()
+        self.series_cutoff.append(0, cutoff_v)
+        self.series_cutoff.append(x_max, cutoff_v)
+
+    def _on_cutoff_changed(self, _value: float):
+        self._update_cutoff_line()
+
+    def _on_scan_devices(self):
+        self.device_combo.clear()
+        self.device_combo.addItem("Auto (first available)", None)
+        try:
+            serials = wmr_cba.CBA4.scan()
+            for sn in serials:
+                self.device_combo.addItem(f"CBA-IV (SN: {sn})", sn)
+            if serials:
+                self._append_log(f"Scan: found {len(serials)} device(s).")
+                self.device_combo.setCurrentIndex(1)
+            else:
+                self._append_log("Scan: no CBA devices found.")
+        except Exception as e:
+            self._append_log(f"Scan error: {e}")
 
     def _append_log(self, msg: str):
         self.log.appendPlainText(msg)
@@ -348,11 +437,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return f"{h}:{m:02d}:{s:02d}"
         return f"{m}:{s:02d}"
 
+    def _set_stats(self, text: str = "--"):
+        for val in self._stat_fields.values():
+            val.setText(text)
+
     def closeEvent(self, event):
         if self.worker is not None:
             self.worker.request_stop()
             self.worker.wait(3000)
         event.accept()
+
+    def _on_toggle(self):
+        if self._running:
+            self.on_stop()
+        else:
+            self.on_start()
 
     def on_start(self):
         if self.worker is not None:
@@ -364,12 +463,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._reset_series()
         self._append_log(f"Starting: {amps:.3f}A cutoff {cutoff:.3f}V interval {interval_s:.2f}s")
-        self.stat_label.setText("Starting...")
+        self._set_stats("Starting...")
 
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self._running = True
+        self.toggle_btn.setText("Stop")
 
-        self.worker = CbaWorker(amps=amps, cutoff=cutoff, interval_s=interval_s)
+        serial_number = self.device_combo.currentData()
+        self.worker = CbaWorker(amps=amps, cutoff=cutoff, interval_s=interval_s,
+                                serial_number=serial_number)
         self.worker.sample_signal.connect(self.on_sample)
         self.worker.status_signal.connect(self.on_status)
         self.worker.finished_signal.connect(self.on_finished)
@@ -387,7 +488,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_finished(self, msg: str):
         self._append_log(msg)
-        self.stat_label.setText(msg)
 
         # cleanup worker
         if self.worker is not None:
@@ -397,8 +497,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         self.worker = None
 
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self._running = False
+        self.toggle_btn.setText("Start")
 
     def _x_for_sample(self, sample: Sample) -> float:
         if self.xaxis_combo.currentIndex() == 1:
@@ -427,25 +527,26 @@ class MainWindow(QtWidgets.QMainWindow):
             x_last = self._samples[-1].t_s if self._samples else 0
             x_max = max(60.0, x_last * 1.05)
         self.axis_x.setRange(0, x_max)
+        self.axis_x.applyNiceNumbers()
 
         y_hi = self._y_max * 1.25 + 0.1
         self.axis_y.setRange(0, y_hi)
+        self.axis_y.applyNiceNumbers()
+
+        self._update_cutoff_line()
 
     def _on_xaxis_changed(self, _index: int):
         self._replot()
 
     def on_sample(self, sample: Sample):
-        # Friendly fixed-width stat line (similar to your CLI)
+        # Update individual stat fields
         dur = self._fmt_duration(sample.t_s)
-        stat = (
-            f"{dur:>4} ({sample.t_s:6.1f} s) ... "
-            f"{sample.v:9.4f}V ... "
-            f"{sample.a:9.4f}A ... "
-            f"{sample.w:9.3f}W ... "
-            f"{sample.ah:12.6f}Ah ... "
-            f"{sample.wh:12.6f}Wh"
-        )
-        self.stat_label.setText(stat)
+        self._stat_fields["duration"].setText(f"{dur} ({sample.t_s:.1f} s)")
+        self._stat_fields["voltage"].setText(f"{sample.v:.4f} V")
+        self._stat_fields["current"].setText(f"{sample.a:.4f} A")
+        self._stat_fields["power"].setText(f"{sample.w:.3f} W")
+        self._stat_fields["ah"].setText(f"{sample.ah:.6f} Ah")
+        self._stat_fields["wh"].setText(f"{sample.wh:.6f} Wh")
 
         self._samples.append(sample)
 
@@ -470,4 +571,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

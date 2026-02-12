@@ -42,8 +42,12 @@ Launch the graphical interface with live voltage/current/power charting:
 sudo python3 cba_gui.py
 ```
 
-The GUI features a live chart that can be toggled between time and amp-hours
-on the X axis, even mid-test.
+Features:
+- Device selector with scan button for multiple CBA devices
+- Mode selector (currently Constant Current Discharge)
+- Live chart (voltage/current/power) with cutoff voltage threshold line
+- X axis toggleable between time and amp-hours, even mid-test
+- Individual stat readouts for voltage, current, power, Ah, and Wh
 
 ## License
 
