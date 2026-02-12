@@ -58,12 +58,12 @@ class CbaWorker(QtCore.QThread):
     finished_signal = QtCore.pyqtSignal(str) if QT_API == "PyQt6" else QtCore.Signal(str)
 
     def __init__(self, amps: float, cutoff: float, interval_s: float,
-                 serial_number: Optional[int] = None, parent=None):
+                 interface_number: Optional[int] = None, parent=None):
         super().__init__(parent)
         self.amps = float(amps)
         self.cutoff = float(cutoff)
         self.interval_s = float(interval_s)
-        self.serial_number = serial_number
+        self.interface_number = interface_number
 
         self._stop_requested = False
         self._cba = None
@@ -104,10 +104,15 @@ class CbaWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            sn_str = f" (SN: {self.serial_number})" if self.serial_number else ""
-            self.status_signal.emit(f"Using {QT_API}. Connecting to CBA-IV{sn_str}...")
-            self._cba = wmr_cba.CBA4(serial_number=self.serial_number)
-            self.status_signal.emit("Connected. Starting test...")
+            if self.interface_number is not None:
+                self.status_signal.emit(f"Using {QT_API}. Connecting to CBA-IV (device {self.interface_number})...")
+                iface = wmr_cba.MpOrLibUsb(self.interface_number)
+                self._cba = wmr_cba.CBA4(interface=iface)
+            else:
+                self.status_signal.emit(f"Using {QT_API}. Connecting to CBA-IV...")
+                self._cba = wmr_cba.CBA4()
+            sn = self._cba.get_serial_number()
+            self.status_signal.emit(f"Connected (SN: {sn}). Starting test...")
 
             # Start test with device cutoff enforcement
             self._cba.do_start(self.amps, self.cutoff)
@@ -413,8 +418,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_combo.addItem("Auto (first available)", None)
         try:
             serials = wmr_cba.CBA4.scan()
-            for sn in serials:
-                self.device_combo.addItem(f"CBA-IV (SN: {sn})", sn)
+            for idx, sn in enumerate(serials):
+                self.device_combo.addItem(f"CBA-IV (SN: {sn})", idx)
             if serials:
                 self._append_log(f"Scan: found {len(serials)} device(s).")
                 self.device_combo.setCurrentIndex(1)
@@ -468,9 +473,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._running = True
         self.toggle_btn.setText("Stop")
 
-        serial_number = self.device_combo.currentData()
+        interface_number = self.device_combo.currentData()
         self.worker = CbaWorker(amps=amps, cutoff=cutoff, interval_s=interval_s,
-                                serial_number=serial_number)
+                                interface_number=interface_number)
         self.worker.sample_signal.connect(self.on_sample)
         self.worker.status_signal.connect(self.on_status)
         self.worker.finished_signal.connect(self.on_finished)
